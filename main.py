@@ -2,7 +2,8 @@
 OrthoTrack Bot v5 — полная версия
 """
 import asyncio, sqlite3, random, string, os, json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -24,6 +25,10 @@ SENIOR_ADMINS = [int(x) for x in os.getenv("SENIOR_ADMINS", "127036820").split("
 STAFF_IDS     = [int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip()]
 BONUS_PCT     = float(os.getenv("BONUS_PCT", "18"))
 DB_PATH       = "orthotrack.db"
+TZ            = ZoneInfo("Asia/Tashkent")
+
+def now_tashkent():
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
 
 def is_senior(uid): return uid in SENIOR_ADMINS
 def is_staff(uid):  return uid in STAFF_IDS
@@ -148,6 +153,7 @@ def init_db():
             expected_in  TEXT NOT NULL,
             status       TEXT DEFAULT 'pending',
             sent_at      TEXT DEFAULT (datetime('now','localtime')),
+            arrived_at   TEXT,
             bought_at    TEXT,
             bonus        REAL DEFAULT 0,
             ref_number   TEXT UNIQUE NOT NULL,
@@ -163,7 +169,17 @@ def init_db():
             note      TEXT,
             FOREIGN KEY (doctor_id) REFERENCES doctors(id)
         );
+        CREATE TABLE IF NOT EXISTS visits (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            visited_at TEXT DEFAULT (datetime('now','localtime')),
+            added_by   INTEGER
+        );
         """)
+    # Миграция: добавляем arrived_at если колонки нет
+    with db() as con:
+        try:
+            con.execute("ALTER TABLE referrals ADD COLUMN arrived_at TEXT")
+        except: pass
 
 def unique_code():
     with db() as con:
@@ -319,16 +335,17 @@ def doctor_ranking(doctor_id):
 def kb_senior():
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text="⏳ Все ожидаемые"),    KeyboardButton(text="📅 Сегодня")],
-        [KeyboardButton(text="🔍 Поиск по клинике"), KeyboardButton(text="👨‍⚕️ Все врачи")],
-        [KeyboardButton(text="💰 Выплатить бонус"),  KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="📈 Отчёт за неделю"),  KeyboardButton(text="📋 История")],
+        [KeyboardButton(text="🚶 Клиент пришёл"),    KeyboardButton(text="🔍 Поиск по клинике")],
+        [KeyboardButton(text="👨‍⚕️ Все врачи"),        KeyboardButton(text="💰 Выплатить бонус")],
+        [KeyboardButton(text="📊 Статистика"),        KeyboardButton(text="📈 Отчёт за неделю")],
+        [KeyboardButton(text="🗒 Дневной лист"),      KeyboardButton(text="📋 История")],
         [KeyboardButton(text="💾 Бэкап")],
     ])
 
 def kb_staff():
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-        [KeyboardButton(text="⏳ Все ожидаемые"),    KeyboardButton(text="📅 Сегодня")],
-        [KeyboardButton(text="🔍 Поиск по клинике")],
+        [KeyboardButton(text="🚶 Клиент пришёл"),    KeyboardButton(text="⏳ Все ожидаемые")],
+        [KeyboardButton(text="📅 Сегодня"),           KeyboardButton(text="🔍 Поиск по клинике")],
         [KeyboardButton(text="📊 Статистика")],
     ])
 
@@ -405,7 +422,7 @@ class PayBonus(StatesGroup):
     photo  = State()
 
 class ConfirmBought(StatesGroup):
-    photo = State()
+    waiting = State()  # ждём фото чека или ручной ввод времени
 
 class SearchClinic(StatesGroup):
     query = State()
@@ -610,11 +627,13 @@ async def send_confirm(msg: types.Message, state: FSMContext):
         )
         ref_id = cur.lastrowid
     await state.clear()
+    sent_time = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     lines = [f"✅ <b>Направление отправлено!</b>\n🔖 <b>{ref_num}</b>  |  📅 {sent_time}\n"]
     for code, qty in cart:
         name, _ = PRODUCTS.get(code,(code,0))
         lines.append(f"• {name} x{qty}")
     lines.append(f"\n💵 {fmt(total)}\n⏰ Клиент придёт: {hours}")
+    lines.append(f"\n\n📋 <b>Не забудьте:</b> напишите ваш именной код от бота на листок флаера перед отправкой клиента")
     await msg.answer("\n".join(lines), reply_markup=kb_doctor())
     all_admins = list(set(SENIOR_ADMINS + STAFF_IDS))
     adm_lines = [f"🔔 <b>Новый клиент от врача!</b>\n",
@@ -629,7 +648,7 @@ async def send_confirm(msg: types.Message, state: FSMContext):
             await bot.send_message(aid, "\n".join(adm_lines), reply_markup=inline_sale(ref_id))
         except: pass
 
-# ── Купил — автоматическая дата и время ───────
+# ── Купил — просим фото чека или ввод времени ──
 @dp.callback_query(F.data.startswith("bought:"))
 async def cb_bought(call: types.CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -643,11 +662,71 @@ async def cb_bought(call: types.CallbackQuery, state: FSMContext):
     if not ref or ref[5] != "pending":
         await call.answer("Уже обработано"); return
 
-    bought_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    await state.update_data(confirm_ref_id=ref_id)
+    items = json.loads(ref[2])
+    names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
+    await call.message.answer(
+        f"✅ <b>Подтверждение покупки</b>\n\n"
+        f"👨‍⚕️ {ref[10]}\n"
+        f"📦 {names}\n"
+        f"🔖 {ref[9]}\n\n"
+        f"📸 Отправьте <b>фото чека</b>\n"
+        f"— или —\n"
+        f"⌨️ Введите вручную дату и время:\n"
+        f"<i>Например: 02.05.2026 14:35</i>",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="🕐 Сейчас")],
+            [KeyboardButton(text="◀️ Отмена")]
+        ])
+    )
+    await state.set_state(ConfirmBought.waiting)
+    await call.answer()
+
+@dp.message(ConfirmBought.waiting)
+async def confirm_bought_input(msg: types.Message, state: FSMContext):
+    if not is_admin(msg.from_user.id): return
+    data   = await state.get_data()
+    ref_id = data.get("confirm_ref_id")
+
+    if msg.text == "◀️ Отмена":
+        await state.clear()
+        await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id)); return
+
+    with db() as con:
+        ref = con.execute(
+            "SELECT r.*,d.full_name,d.tg_id FROM referrals r JOIN doctors d ON d.id=r.doctor_id WHERE r.id=?",
+            (ref_id,)
+        ).fetchone()
+    if not ref:
+        await state.clear()
+        await msg.answer("❌ Ошибка.", reply_markup=main_kb(msg.from_user.id)); return
+
+    photo_id    = None
+    bought_time = None
+
+    if msg.photo:
+        # Прислали фото чека
+        photo_id    = msg.photo[-1].file_id
+        bought_time = now_tashkent()
+    elif msg.text == "🕐 Сейчас":
+        bought_time = now_tashkent()
+    elif msg.text:
+        # Ручной ввод времени
+        try:
+            dt = datetime.strptime(msg.text.strip(), "%d.%m.%Y %H:%M")
+            bought_time = dt.strftime("%d.%m.%Y %H:%M:%S")
+        except ValueError:
+            await msg.answer(
+                "❌ Неверный формат. Введите дату и время так:\n"
+                "<b>02.05.2026 14:35</b>\n\n"
+                "Или нажмите <b>🕐 Сейчас</b>"
+            ); return
+
+    await state.clear()
     bonus = round(ref[3] * BONUS_PCT / 100)
     with db() as con:
         con.execute("UPDATE referrals SET status='bought',bought_at=?,bonus=?,confirmed_by=? WHERE id=?",
-                    (bought_time, bonus, call.from_user.id, ref_id))
+                    (bought_time, bonus, msg.from_user.id, ref_id))
     _, _, total_earned, total_paid = doctor_stats(ref[1])
     balance = total_earned - total_paid
 
@@ -658,28 +737,24 @@ async def cb_bought(call: types.CallbackQuery, state: FSMContext):
         f"{cart_to_text(ref[2])}\n\n"
         f"💰 Бонус врача: <b>{fmt(bonus)}</b>"
     )
-    await call.message.edit_text(confirm_text)
-    await call.answer("✅ Записано!")
+
+    # Ответ подтверждающему
+    if photo_id:
+        await msg.answer_photo(photo_id, caption=confirm_text, reply_markup=main_kb(msg.from_user.id))
+    else:
+        await msg.answer(confirm_text, reply_markup=main_kb(msg.from_user.id))
 
     # Уведомление всем старшим админам
     for aid in SENIOR_ADMINS:
-        if aid != call.from_user.id:
+        if aid != msg.from_user.id:
             try:
-                await bot.send_message(aid, confirm_text)
+                if photo_id:
+                    await bot.send_photo(aid, photo_id, caption=confirm_text)
+                else:
+                    await bot.send_message(aid, confirm_text)
             except: pass
 
-    # Уведомление врачу
-    if ref[11]:
-        try:
-            await bot.send_message(ref[11],
-                f"🎉 <b>Ваш клиент совершил покупку!</b>\n\n"
-                f"🔖 {ref[9]}\n"
-                f"📅 <b>{bought_time}</b>\n\n"
-                f"{cart_to_text(ref[2])}\n\n"
-                f"💰 Начислено: <b>{fmt(bonus)}</b>\n"
-                f"💵 К выплате: <b>{fmt(int(balance))}</b>"
-            )
-        except: pass
+    # Врач НЕ получает уведомление сразу — только в 22:00 итог дня
 
 # ── Не купил ──────────────────────────────────
 @dp.callback_query(F.data.startswith("nobuy:"))
@@ -710,6 +785,22 @@ async def cb_nobuy(call: types.CallbackQuery):
                     f"📊 <b>Отчёт</b>\n🔖 {ref[9]}\n📅 {nobuy_time}\n\n{cart_to_text(ref[2])}\n\n❌ Клиент не купил.")
             except: pass
     await call.answer()
+
+# ── Счётчик посетителей ───────────────────────
+@dp.message(F.text == "🚶 Клиент пришёл")
+async def client_arrived(msg: types.Message):
+    if not is_admin(msg.from_user.id): return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with db() as con:
+        con.execute("INSERT INTO visits (added_by) VALUES (?)", (msg.from_user.id,))
+        count = con.execute(
+            "SELECT COUNT(*) FROM visits WHERE visited_at LIKE ?",
+            (f"{today}%",)
+        ).fetchone()[0]
+    await msg.answer(
+        f"🚶 <b>Клиент зафиксирован!</b>\n\n"
+        f"📅 Сегодня зашло клиентов: <b>{count}</b>"
+    )
 
 # ── Поиск по клинике ──────────────────────────
 @dp.message(F.text == "🔍 Поиск по клинике")
@@ -846,17 +937,30 @@ async def doc_stats(msg: types.Message):
     balance   = earned - paid
     notbought = total - bought
     conv      = round(bought/total*100) if total else 0
-    rank, total_docs = doctor_ranking(doc[0])
+
+    # Показываем только данные до вчерашнего дня включительно
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with db() as con:
+        prev = con.execute("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN status='bought' THEN 1 ELSE 0 END),
+                   COALESCE(SUM(CASE WHEN status='bought' THEN bonus ELSE 0 END),0)
+            FROM referrals WHERE doctor_id=? AND sent_at NOT LIKE ?
+        """, (doc[0], f"{today}%")).fetchone()
+    prev_bought = prev[1] or 0
+    prev_bonus  = prev[2] or 0
+    prev_balance = prev_bonus - paid
+
     await msg.answer(
         f"📊 <b>Ваша статистика</b>\n\n"
         f"👤 {doc[2]}\n🏥 {doc[3]}\n📱 {doc[4]}\n\n"
-        f"📤 Направлений: <b>{total}</b>\n"
+        f"📤 Всего направлений: <b>{total}</b>\n"
         f"✅ Купили: <b>{bought}</b>  ❌ Не купили: <b>{notbought}</b>\n"
-        f"📈 Конверсия: <b>{conv}%</b>\n"
-        f"🏆 Рейтинг: <b>{rank} из {total_docs}</b>\n\n"
-        f"💰 Заработано: <b>{fmt(int(earned))}</b>\n"
+        f"📈 Конверсия: <b>{conv}%</b>\n\n"
+        f"💰 Заработано (до сегодня): <b>{fmt(int(prev_bonus))}</b>\n"
         f"✅ Выплачено: <b>{fmt(int(paid))}</b>\n"
-        f"💵 <b>К выплате: {fmt(int(balance))}</b>"
+        f"💵 <b>К выплате: {fmt(int(max(0, prev_balance)))}</b>\n\n"
+        f"<i>Бонусы за сегодня придут в 22:00 🌙</i>"
     )
 
 @dp.message(F.text == "📅 За месяц")
@@ -1019,6 +1123,83 @@ async def admin_history(msg: types.Message):
         lines.append(f"{sm.get(status,'?')} <b>{name}</b> — {ref_num}{b}\n   {names}{dt}\n   🕐 {sent_at[:16]}\n")
     await msg.answer("\n".join(lines))
 
+@dp.message(F.text == "🗒 Дневной лист")
+async def admin_daily_sheet(msg: types.Message):
+    if not is_senior(msg.from_user.id): return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with db() as con:
+        refs = con.execute("""
+            SELECT r.id, d.full_name, d.clinic, r.items_json, r.status,
+                   r.bonus, r.sent_at, r.bought_at, r.ref_number
+            FROM referrals r JOIN doctors d ON d.id=r.doctor_id
+            WHERE r.sent_at LIKE ?
+            ORDER BY r.sent_at ASC
+        """, (f"{today}%",)).fetchall()
+
+    if not refs:
+        await msg.answer(f"📭 Сегодня ({today}) направлений нет."); return
+
+    bought_list    = [r for r in refs if r[4] == "bought"]
+    notbought_list = [r for r in refs if r[4] == "notbought"]
+    pending_list   = [r for r in refs if r[4] == "pending"]
+
+    # Считаем посетителей за сегодня
+    with db() as con:
+        visitors = con.execute(
+            "SELECT COUNT(*) FROM visits WHERE visited_at LIKE ?",
+            (f"{today}%",)
+        ).fetchone()[0]
+
+    await msg.answer(
+        f"🗒 <b>Дневной лист — {datetime.now(TZ).strftime('%d.%m.%Y')}</b>\n\n"
+        f"🚶 Всего зашло в магазин: <b>{visitors}</b>\n\n"
+        f"✅ Купили (от врачей): <b>{len(bought_list)}</b>\n"
+        f"❌ Не купили: <b>{len(notbought_list)}</b>\n"
+        f"⏳ Под вопросом: <b>{len(pending_list)}</b>\n"
+        f"📤 Всего направлений: <b>{len(refs)}</b>"
+    )
+
+    # Купили
+    if bought_list:
+        await msg.answer("✅ <b>КУПИЛИ:</b>")
+        for ref_id, name, clinic, items_json, status, bonus, sent_at, bought_at, ref_num in bought_list:
+            items = json.loads(items_json)
+            names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
+            await msg.answer(
+                f"✅ <b>{name}</b>  ({clinic})\n"
+                f"📦 {names}\n"
+                f"🔖 {ref_num}\n"
+                f"📅 Куплено: <b>{bought_at}</b>\n"
+                f"💰 Бонус: <b>{fmt(int(bonus))}</b>"
+            )
+
+    # Не купили
+    if notbought_list:
+        await msg.answer("❌ <b>НЕ КУПИЛИ:</b>")
+        for ref_id, name, clinic, items_json, status, bonus, sent_at, bought_at, ref_num in notbought_list:
+            items = json.loads(items_json)
+            names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
+            await msg.answer(
+                f"❌ <b>{name}</b>  ({clinic})\n"
+                f"📦 {names}\n"
+                f"🔖 {ref_num}\n"
+                f"📅 Отмечено: {bought_at[:16] if bought_at else '—'}"
+            )
+
+    # Под вопросом — с кнопками
+    if pending_list:
+        await msg.answer(
+            f"⏳ <b>ПОД ВОПРОСОМ — нужно отметить:</b>\n\n"
+            f"<i>Сверьте с кассой и нажмите купил/не купил</i>"
+        )
+        for ref_id, name, clinic, items_json, status, bonus, sent_at, bought_at, ref_num in pending_list:
+            await msg.answer(
+                f"⏳ <b>{name}</b>  ({clinic})\n"
+                f"{cart_to_text(items_json)}\n"
+                f"🔖 {ref_num}  |  🕐 {sent_at[11:16]}",
+                reply_markup=inline_sale(ref_id)
+            )
+
 # ── Бэкап ─────────────────────────────────────
 async def send_backup(chat_id: int):
     if not os.path.exists(DB_PATH):
@@ -1046,13 +1227,13 @@ async def cmd_backup(msg: types.Message):
 # ── Ежедневные задачи ─────────────────────────
 async def daily_tasks():
     while True:
-        now    = datetime.now()
-        target = now.replace(hour=22, minute=0, second=0, microsecond=0)
-        if now >= target:
+        now_tz = datetime.now(TZ)
+        target = now_tz.replace(hour=22, minute=0, second=0, microsecond=0)
+        if now_tz >= target:
             target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
+        await asyncio.sleep((target - now_tz).total_seconds())
 
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
 
         # Итог дня для каждого врача в 22:00
         with db() as con:
@@ -1063,45 +1244,84 @@ async def daily_tasks():
         for doc_id, tg_id, name in docs:
             try:
                 with db() as con:
+                    # Только подтверждённые покупки за сегодня
                     row = con.execute("""
                         SELECT COUNT(*),
                                SUM(CASE WHEN status='bought' THEN 1 ELSE 0 END),
                                COALESCE(SUM(CASE WHEN status='bought' THEN bonus ELSE 0 END),0)
                         FROM referrals WHERE doctor_id=? AND sent_at LIKE ?
                     """, (doc_id, f"{today}%")).fetchone()
+                    # Незакрытые за сегодня (перенесутся на завтра)
+                    td_pending = con.execute("""
+                        SELECT COUNT(*) FROM referrals
+                        WHERE doctor_id=? AND status='pending' AND sent_at LIKE ?
+                    """, (doc_id, f"{today}%")).fetchone()[0] or 0
+
                 td_total  = row[0] or 0
                 td_bought = row[1] or 0
                 td_bonus  = row[2] or 0
+
+                _, _, total_earned, total_paid = doctor_stats(doc_id)
+                balance = total_earned - total_paid
+
+                # Отправляем только если были направления за сегодня
                 if td_total > 0:
-                    _, _, month_earned, month_paid = doctor_stats(doc_id)
-                    month_balance = month_earned - month_paid
+                    pending_note = (
+                        f"\n⏳ Под вопросом: <b>{td_pending}</b>\n"
+                        f"<i>(результат придёт завтра в 22:00)</i>"
+                    ) if td_pending > 0 else ""
                     await bot.send_message(tg_id,
-                        f"🌙 <b>Итог дня — {datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
-                        f"📤 Направлений сегодня: <b>{td_total}</b>\n"
+                        f"🌙 <b>Итог дня — {datetime.now(TZ).strftime('%d.%m.%Y')}</b>\n\n"
+                        f"📤 Направлений: <b>{td_total}</b>\n"
                         f"✅ Купили: <b>{td_bought}</b>\n"
-                        f"💰 Бонус за сегодня: <b>{fmt(int(td_bonus))}</b>\n\n"
-                        f"💵 Всего к выплате: <b>{fmt(int(month_balance))}</b>"
+                        f"💰 <b>Бонус за сегодня: {fmt(int(td_bonus))}</b>"
+                        f"{pending_note}\n\n"
+                        f"💵 Всего к выплате: <b>{fmt(int(balance))}</b>"
                     )
             except: pass
 
-        # Напоминание о клиентах которые не пришли > 24 часа
-        yesterday = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        # Pending из прошлых дней — отправляем итог врачам если уже закрыты
+        yesterday_date = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+        with db() as con:
+            old_bought = con.execute("""
+                SELECT r.doctor_id, d.tg_id, d.full_name,
+                       COUNT(*) as cnt,
+                       COALESCE(SUM(r.bonus),0) as bonus
+                FROM referrals r JOIN doctors d ON d.id=r.doctor_id
+                WHERE r.status='bought'
+                  AND r.bought_at LIKE ? AND r.sent_at NOT LIKE ?
+                GROUP BY r.doctor_id
+            """, (f"{today}%", f"{today}%")).fetchall()
+        for doc_id, doc_tg, doc_name, cnt, bonus in old_bought:
+            if doc_tg and cnt > 0:
+                try:
+                    _, _, total_earned, total_paid = doctor_stats(doc_id)
+                    balance = total_earned - total_paid
+                    await bot.send_message(doc_tg,
+                        f"🌙 <b>Дополнительный итог — {datetime.now(TZ).strftime('%d.%m.%Y')}</b>\n\n"
+                        f"✅ Подтверждено покупок (прошлые дни): <b>{cnt}</b>\n"
+                        f"💰 <b>Бонус: {fmt(int(bonus))}</b>\n\n"
+                        f"💵 Всего к выплате: <b>{fmt(int(balance))}</b>"
+                    )
+                except: pass
+        # Напоминание врачам о pending > 24 часа
+        cutoff = (datetime.now(TZ) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
         with db() as con:
             old_refs = con.execute("""
                 SELECT r.id, d.tg_id, r.items_json, r.ref_number, r.sent_at
                 FROM referrals r JOIN doctors d ON d.id=r.doctor_id
                 WHERE r.status='pending' AND r.sent_at <= ?
-            """, (yesterday,)).fetchall()
+            """, (cutoff,)).fetchall()
         for ref_id, doc_tg, items_json, ref_num, sent_at in old_refs:
             if doc_tg:
                 try:
                     items = json.loads(items_json)
                     names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
                     await bot.send_message(doc_tg,
-                        f"⚠️ <b>Клиент ещё не пришёл</b>\n\n"
+                        f"⚠️ <b>Клиент ещё под вопросом</b>\n\n"
                         f"🔖 {ref_num}\n📦 {names}\n"
                         f"🕐 Отправлено: {sent_at[:16]}\n\n"
-                        f"Уточните у клиента когда придёт."
+                        f"Результат придёт в 22:00 когда администратор подтвердит."
                     )
                 except: pass
 
