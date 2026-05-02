@@ -633,7 +633,7 @@ async def send_confirm(msg: types.Message, state: FSMContext):
         name, _ = PRODUCTS.get(code,(code,0))
         lines.append(f"• {name} x{qty}")
     lines.append(f"\n💵 {fmt(total)}\n⏰ Клиент придёт: {hours}")
-    lines.append(f"\n\n📋 <b>Не забудьте:</b> напишите ваш именной код от бота на листок флаера перед отправкой клиента")
+    lines.append(f"\n\n📋 <b>Не забудьте:</b> напишите ваш номер телефона в листок флаера перед отправкой клиента")
     await msg.answer("\n".join(lines), reply_markup=kb_doctor())
     all_admins = list(set(SENIOR_ADMINS + STAFF_IDS))
     adm_lines = [f"🔔 <b>Новый клиент от врача!</b>\n",
@@ -799,8 +799,62 @@ async def client_arrived(msg: types.Message):
         ).fetchone()[0]
     await msg.answer(
         f"🚶 <b>Клиент зафиксирован!</b>\n\n"
-        f"📅 Сегодня зашло клиентов: <b>{count}</b>"
+        f"📅 Сегодня зашло клиентов: <b>{count}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Ещё один", callback_data="visit_add"),
+            InlineKeyboardButton(text="➖ Убрать",   callback_data="visit_remove"),
+        ]])
     )
+
+@dp.callback_query(F.data == "visit_add")
+async def visit_add(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа"); return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with db() as con:
+        con.execute("INSERT INTO visits (added_by) VALUES (?)", (call.from_user.id,))
+        count = con.execute(
+            "SELECT COUNT(*) FROM visits WHERE visited_at LIKE ?",
+            (f"{today}%",)
+        ).fetchone()[0]
+    await call.message.edit_text(
+        f"🚶 <b>Клиент добавлен!</b>\n\n"
+        f"📅 Сегодня зашло клиентов: <b>{count}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Ещё один", callback_data="visit_add"),
+            InlineKeyboardButton(text="➖ Убрать",   callback_data="visit_remove"),
+        ]])
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "visit_remove")
+async def visit_remove(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа"); return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with db() as con:
+        # Удаляем последнюю запись за сегодня
+        last = con.execute(
+            "SELECT id FROM visits WHERE visited_at LIKE ? ORDER BY id DESC LIMIT 1",
+            (f"{today}%",)
+        ).fetchone()
+        if last:
+            con.execute("DELETE FROM visits WHERE id=?", (last[0],))
+        count = con.execute(
+            "SELECT COUNT(*) FROM visits WHERE visited_at LIKE ?",
+            (f"{today}%",)
+        ).fetchone()[0]
+    if not last:
+        await call.answer("Нельзя убрать — счётчик уже 0"); return
+    await call.message.edit_text(
+        f"➖ <b>Убрано!</b>\n\n"
+        f"📅 Сегодня зашло клиентов: <b>{count}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Ещё один", callback_data="visit_add"),
+            InlineKeyboardButton(text="➖ Убрать",   callback_data="visit_remove"),
+        ]])
+    )
+    await call.answer()
 
 # ── Поиск по клинике ──────────────────────────
 @dp.message(F.text == "🔍 Поиск по клинике")
