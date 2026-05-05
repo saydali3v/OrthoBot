@@ -616,7 +616,8 @@ async def reg_phone(msg: types.Message, state: FSMContext):
     await msg.answer(
         f"✅ <b>Регистрация завершена!</b>\n\n"
         f"👤 {full_name}\n🏥 {data['clinic']}\n📱 {phone}\n\n"
-        f"За каждую покупку — <b>{BONUS_PCT:.0f}% бонус</b> 💰",
+        f"Вы подключены к системе OrthoShop 💰\n"
+        f"Бонусы приходят каждый день в <b>22:00</b> 🌙",
         reply_markup=kb_doctor()
     )
     for aid in SENIOR_ADMINS:
