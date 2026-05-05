@@ -114,16 +114,21 @@ HOURS_OPTIONS = ["1 час","2 часа","3 часа","4 часа","5 часов
 def fmt(amount: int) -> str:
     return f"{int(amount):,}".replace(",", " ") + " сум"
 
-def cart_to_text(items_json: str) -> str:
+def cart_to_text(items_json: str, show_prices: bool = True) -> str:
     items = json.loads(items_json)
     lines = []
     total = 0
     for code, qty in items:
-        name, price = PRODUCTS.get(code, (code, 0))
-        sub = price * qty
+        name, base_price = PRODUCTS.get(code, (code, 0))
+        price = get_price(code)
+        sub   = price * qty
         total += sub
-        lines.append(f"  • {name} x{qty} = {fmt(sub)}")
-    lines.append(f"\n💵 Итого: {fmt(total)}")
+        if show_prices:
+            lines.append(f"  • {name} x{qty} = {fmt(sub)}")
+        else:
+            lines.append(f"  • {name} x{qty}")
+    if show_prices:
+        lines.append(f"\n💵 Итого: {fmt(total)}")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
@@ -175,6 +180,20 @@ def init_db():
             visited_at TEXT DEFAULT (datetime('now','localtime')),
             added_by   INTEGER
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS custom_products (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            code       TEXT UNIQUE NOT NULL,
+            name       TEXT NOT NULL,
+            category   TEXT NOT NULL,
+            price      INTEGER NOT NULL,
+            bonus_pct  REAL DEFAULT 0,
+            is_active  INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
         """)
     # Миграции
     with db() as con:
@@ -183,7 +202,67 @@ def init_db():
         except: pass
         try:
             con.execute("ALTER TABLE referrals ADD COLUMN notified INTEGER DEFAULT 0")
-        except: pass
+        except: pass        # Начальные настройки
+        con.execute("INSERT OR IGNORE INTO settings (key,value) VALUES ('bonus_pct','18')")
+        # Начальные цены из каталога
+        for code, name, price in [item for items in CATEGORIES.values() for item in items]:
+            con.execute(
+                "INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)",
+                (f"price_{code}", str(price))
+            )
+
+def get_custom_products():
+    """Возвращает все активные кастомные товары"""
+    with db() as con:
+        return con.execute(
+            "SELECT code, name, category, price, bonus_pct FROM custom_products WHERE is_active=1"
+        ).fetchall()
+
+def get_all_categories():
+    """Возвращает CATEGORIES + кастомные товары"""
+    result = {k: list(v) for k, v in CATEGORIES.items()}
+    for code, name, category, price, bonus_pct in get_custom_products():
+        if category not in result:
+            result[category] = []
+        if not any(c == code for c, n, p in result[category]):
+            result[category].append((code, name, price))
+    return result
+
+def get_all_products():
+    """Возвращает PRODUCTS + кастомные товары"""
+    result = dict(PRODUCTS)
+    for code, name, category, price, bonus_pct in get_custom_products():
+        result[code] = (name, price)
+    return result
+
+def get_product_bonus_pct(code):
+    """Возвращает индивидуальный % бонуса для товара или общий"""
+    with db() as con:
+        row = con.execute(
+            "SELECT bonus_pct FROM custom_products WHERE code=? AND bonus_pct > 0",
+            (code,)
+        ).fetchone()
+    return row[0] if row else get_bonus_pct()
+
+def get_setting(key, default=None):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, str(value)))
+
+def get_bonus_pct():
+    return float(get_setting("bonus_pct", "18"))
+
+def get_price(code):
+    val = get_setting(f"price_{code}")
+    if val: return int(val)
+    for items in CATEGORIES.values():
+        for c, n, p in items:
+            if c == code: return p
+    return 0
 
 def unique_code():
     with db() as con:
@@ -343,7 +422,7 @@ def kb_senior():
         [KeyboardButton(text="👨‍⚕️ Все врачи"),        KeyboardButton(text="💰 Выплатить бонус")],
         [KeyboardButton(text="📊 Статистика"),        KeyboardButton(text="📈 Отчёт за неделю")],
         [KeyboardButton(text="🗒 Дневной лист"),      KeyboardButton(text="📋 История")],
-        [KeyboardButton(text="💾 Бэкап")],
+        [KeyboardButton(text="⚙️ Настройки"),         KeyboardButton(text="💾 Бэкап")],
     ])
 
 def kb_staff():
@@ -366,14 +445,24 @@ def main_kb(uid):
     return kb_doctor()
 
 def kb_categories():
-    buttons = [[KeyboardButton(text=cat)] for cat in CATEGORIES.keys()]
+    cats = get_all_categories()
+    buttons = [[KeyboardButton(text=cat)] for cat in cats.keys()]
     buttons.append([KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="✅ Отправить направление")])
     buttons.append([KeyboardButton(text="◀️ Отмена")])
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
 
+def kb_products_doctor(category):
+    cats = get_all_categories()
+    items = cats.get(category, [])
+    buttons = [[KeyboardButton(text=name)] for _, name, price in items]
+    buttons.append([KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="✅ Отправить направление")])
+    buttons.append([KeyboardButton(text="◀️ К категориям")])
+    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
+
 def kb_products(category):
-    items = CATEGORIES.get(category, [])
-    buttons = [[KeyboardButton(text=f"{name} — {fmt(price)}")] for _, name, price in items]
+    cats = get_all_categories()
+    items = cats.get(category, [])
+    buttons = [[KeyboardButton(text=f"{name} — {fmt(get_price(code))}")] for code, name, price in items]
     buttons.append([KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="✅ Отправить направление")])
     buttons.append([KeyboardButton(text="◀️ К категориям")])
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
@@ -430,6 +519,20 @@ class ConfirmBought(StatesGroup):
 
 class SearchClinic(StatesGroup):
     query = State()
+
+class Settings(StatesGroup):
+    menu        = State()
+    bonus_pct   = State()
+    price_cat   = State()
+    price_item  = State()
+    price_value = State()
+    new_prod_cat   = State()
+    new_prod_name  = State()
+    new_prod_price = State()
+    new_prod_bonus = State()
+
+class ConfirmBonus(StatesGroup):
+    edit = State()
 
 # ─────────────────────────────────────────────
 # БОТ
@@ -546,45 +649,68 @@ async def shopping(msg: types.Message, state: FSMContext):
     if text == "🛒 Корзина":
         if not cart:
             await msg.answer("🛒 Корзина пуста."); return
-        total = sum(PRODUCTS.get(c,("",0))[1]*q for c,q in cart)
+        is_doc = not is_admin(msg.from_user.id)
         lines = ["🛒 <b>Корзина:</b>\n"]
+        total = 0
         for code, qty in cart:
-            name, price = PRODUCTS.get(code,(code,0))
-            lines.append(f"• {name} x{qty} = {fmt(price*qty)}")
-        lines.append(f"\n💵 <b>Итого: {fmt(total)}</b>")
+            name, _ = PRODUCTS.get(code,(code,0))
+            price = get_price(code)
+            sub = price * qty
+            total += sub
+            lines.append(f"• {name} x{qty}" if is_doc else f"• {name} x{qty} = {fmt(sub)}")
+        if not is_doc:
+            lines.append(f"\n💵 <b>Итого: {fmt(total)}</b>")
         await msg.answer("\n".join(lines)); return
+
     if text == "✅ Отправить направление":
         if not cart:
             await msg.answer("🛒 Добавьте товар!"); return
-        total = sum(PRODUCTS.get(c,("",0))[1]*q for c,q in cart)
+        is_doc = not is_admin(msg.from_user.id)
+        total = sum(get_price(c)*q for c,q in cart)
         lines = ["✅ <b>Товары:</b>\n"]
         for code, qty in cart:
-            name, price = PRODUCTS.get(code,(code,0))
-            lines.append(f"• {name} x{qty} = {fmt(price*qty)}")
-        lines.append(f"\n💵 <b>Итого: {fmt(total)}</b>\n\n⏰ <b>Через сколько придёт клиент?</b>")
+            name, _ = PRODUCTS.get(code,(code,0))
+            lines.append(f"• {name} x{qty}" if is_doc else f"• {name} x{qty} = {fmt(get_price(code)*qty)}")
+        if not is_doc:
+            lines.append(f"\n💵 <b>Итого: {fmt(total)}</b>")
+        lines.append(f"\n⏰ <b>Через сколько придёт клиент?</b>")
         await msg.answer("\n".join(lines), reply_markup=kb_hours())
         await state.set_state(SendClient.hours); return
-    if text in CATEGORIES:
+
+    all_cats = get_all_categories()
+    if text in all_cats:
         await state.update_data(current_cat=text)
         cnt = sum(q for _,q in cart)
         hint = f"🛒 {cnt} товаров\n\n" if cnt else ""
-        await msg.answer(f"{hint}📋 <b>{text}</b>\nВыберите товар:", reply_markup=kb_products(text)); return
+        is_doc = not is_admin(msg.from_user.id)
+        kb = kb_products_doctor(text) if is_doc else kb_products(text)
+        await msg.answer(f"{hint}📋 <b>{text}</b>\nВыберите товар:", reply_markup=kb); return
+
     current_cat = data.get("current_cat")
-    if current_cat and current_cat in CATEGORIES:
-        for code, name, price in CATEGORIES[current_cat]:
-            if text == f"{name} — {fmt(price)}":
+    if current_cat and current_cat in all_cats:
+        is_doc = not is_admin(msg.from_user.id)
+        for code, name, price in all_cats[current_cat]:
+            btn_text = name if is_doc else f"{name} — {fmt(get_price(code))}"
+            if text == btn_text:
                 found = False
                 for i,(c,q) in enumerate(cart):
                     if c == code:
                         cart[i] = (c, q+1); found = True; break
                 if not found: cart.append((code, 1))
                 await state.update_data(cart=cart)
-                total = sum(PRODUCTS.get(c,("",0))[1]*q for c,q in cart)
-                await msg.answer(
-                    f"✅ <b>{name}</b> добавлен!\n"
-                    f"🛒 {sum(q for _,q in cart)} товаров | 💵 {fmt(total)}\n\n"
-                    f"Добавьте ещё или нажмите <b>✅ Отправить направление</b>"
-                ); return
+                total = sum(get_price(c)*q for c,q in cart)
+                cnt_msg = f"🛒 {sum(q for _,q in cart)} товаров"
+                if is_doc:
+                    await msg.answer(
+                        f"✅ <b>{name}</b> добавлен!\n{cnt_msg}\n\n"
+                        f"Добавьте ещё или нажмите <b>✅ Отправить направление</b>"
+                    )
+                else:
+                    await msg.answer(
+                        f"✅ <b>{name}</b> добавлен!\n{cnt_msg} | 💵 {fmt(total)}\n\n"
+                        f"Добавьте ещё или нажмите <b>✅ Отправить направление</b>"
+                    )
+                return
     await msg.answer("Выберите из списка:")
 
 @dp.message(SendClient.hours)
@@ -595,14 +721,17 @@ async def send_hours(msg: types.Message, state: FSMContext):
     if msg.text not in HOURS_OPTIONS:
         await msg.answer("Выберите время из списка:"); return
     await state.update_data(hours=msg.text)
-    data  = await state.get_data()
-    cart  = data["cart"]
-    total = sum(PRODUCTS.get(c,("",0))[1]*q for c,q in cart)
-    lines = ["📋 <b>Подтвердите направление:</b>\n"]
+    data   = await state.get_data()
+    cart   = data["cart"]
+    is_doc = not is_admin(msg.from_user.id)
+    total  = sum(get_price(c)*q for c,q in cart)
+    lines  = ["📋 <b>Подтвердите направление:</b>\n"]
     for code, qty in cart:
-        name, price = PRODUCTS.get(code,(code,0))
-        lines.append(f"• {name} x{qty} = {fmt(price*qty)}")
-    lines.append(f"\n💵 <b>{fmt(total)}</b>\n⏰ Клиент придёт: <b>{msg.text}</b>")
+        name, _ = PRODUCTS.get(code,(code,0))
+        lines.append(f"• {name} x{qty}" if is_doc else f"• {name} x{qty} = {fmt(get_price(code)*qty)}")
+    if not is_doc:
+        lines.append(f"\n💵 <b>{fmt(total)}</b>")
+    lines.append(f"\n⏰ Клиент придёт: <b>{msg.text}</b>")
     await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text="✅ Подтвердить")], [KeyboardButton(text="◀️ Назад")]
     ]))
@@ -618,9 +747,9 @@ async def send_confirm(msg: types.Message, state: FSMContext):
     cart       = data["cart"]
     hours      = data["hours"]
     items_json = json.dumps(cart)
-    total      = sum(PRODUCTS.get(c,("",0))[1]*q for c,q in cart)
+    total      = sum(get_price(c)*q for c,q in cart)
     ref_num    = unique_ref()
-    sent_time  = datetime.now().strftime("%d.%m.%Y %H:%M")
+    sent_time  = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     with db() as con:
         cur = con.execute(
             "INSERT INTO referrals (doctor_id,items_json,total_price,expected_in,ref_number) VALUES (?,?,?,?,?)",
@@ -663,7 +792,12 @@ async def cb_bought(call: types.CallbackQuery, state: FSMContext):
     if not ref or ref[5] != "pending":
         await call.answer("Уже обработано"); return
 
-    await state.update_data(confirm_ref_id=ref_id)
+    bought_time = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
+    bonus_pct = get_bonus_pct()
+    bonus = round(ref[3] * bonus_pct / 100)
+
+    # Показываем подтверждение с возможностью изменить бонус
+    await state.update_data(confirm_ref_id=ref_id, default_bonus=bonus)
     items = json.loads(ref[2])
     names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
     await call.message.answer(
@@ -671,12 +805,13 @@ async def cb_bought(call: types.CallbackQuery, state: FSMContext):
         f"👨‍⚕️ {ref[10]}\n"
         f"📦 {names}\n"
         f"🔖 {ref[9]}\n\n"
+        f"💰 Бонус врача: <b>{fmt(bonus)}</b> ({bonus_pct:.0f}%)\n\n"
         f"📸 Отправьте <b>фото чека</b>\n"
         f"— или —\n"
-        f"⌨️ Введите вручную дату и время:\n"
-        f"<i>Например: 02.05.2026 14:35</i>",
+        f"⌨️ Введите дату и время вручную: <i>02.05.2026 14:35</i>",
         reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
             [KeyboardButton(text="🕐 Сейчас")],
+            [KeyboardButton(text=f"✏️ Изменить бонус (сейчас {fmt(bonus)})")],
             [KeyboardButton(text="◀️ Отмена")]
         ])
     )
@@ -686,12 +821,24 @@ async def cb_bought(call: types.CallbackQuery, state: FSMContext):
 @dp.message(ConfirmBought.waiting)
 async def confirm_bought_input(msg: types.Message, state: FSMContext):
     if not is_admin(msg.from_user.id): return
-    data   = await state.get_data()
-    ref_id = data.get("confirm_ref_id")
+    data          = await state.get_data()
+    ref_id        = data.get("confirm_ref_id")
+    default_bonus = data.get("default_bonus", 0)
 
     if msg.text == "◀️ Отмена":
         await state.clear()
         await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id)); return
+
+    # Изменить бонус — только старший админ
+    if msg.text and msg.text.startswith("✏️ Изменить бонус") and is_senior(msg.from_user.id):
+        await msg.answer(
+            f"✏️ Введите новую сумму бонуса в сумах:\n<i>Текущий: {fmt(int(default_bonus))}</i>",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+                [KeyboardButton(text="◀️ Отмена")]
+            ])
+        )
+        await state.set_state(ConfirmBonus.edit)
+        return
 
     with db() as con:
         ref = con.execute(
@@ -702,50 +849,44 @@ async def confirm_bought_input(msg: types.Message, state: FSMContext):
         await state.clear()
         await msg.answer("❌ Ошибка.", reply_markup=main_kb(msg.from_user.id)); return
 
-    photo_id    = None
+    photo_id = None
     bought_time = None
 
     if msg.photo:
-        # Прислали фото чека
         photo_id    = msg.photo[-1].file_id
         bought_time = now_tashkent()
     elif msg.text == "🕐 Сейчас":
         bought_time = now_tashkent()
     elif msg.text:
-        # Ручной ввод времени
         try:
             dt = datetime.strptime(msg.text.strip(), "%d.%m.%Y %H:%M")
             bought_time = dt.strftime("%d.%m.%Y %H:%M:%S")
         except ValueError:
             await msg.answer(
-                "❌ Неверный формат. Введите дату и время так:\n"
-                "<b>02.05.2026 14:35</b>\n\n"
+                "❌ Неверный формат.\nВведите: <b>02.05.2026 14:35</b>\n"
                 "Или нажмите <b>🕐 Сейчас</b>"
             ); return
 
+    bonus = data.get("custom_bonus", default_bonus)
     await state.clear()
-    bonus = round(ref[3] * BONUS_PCT / 100)
+
     with db() as con:
         con.execute("UPDATE referrals SET status='bought',bought_at=?,bonus=?,confirmed_by=? WHERE id=?",
                     (bought_time, bonus, msg.from_user.id, ref_id))
-    _, _, total_earned, total_paid = doctor_stats(ref[1])
-    balance = total_earned - total_paid
 
     confirm_text = (
         f"✅ <b>Продажа подтверждена!</b>\n\n"
         f"👨‍⚕️ {ref[10]}\n🔖 {ref[9]}\n"
         f"📅 <b>{bought_time}</b>\n\n"
-        f"{cart_to_text(ref[2])}\n\n"
-        f"💰 Бонус врача: <b>{fmt(bonus)}</b>"
+        f"{cart_to_text(ref[2], show_prices=True)}\n\n"
+        f"💰 Бонус врача: <b>{fmt(int(bonus))}</b>"
     )
 
-    # Ответ подтверждающему
     if photo_id:
         await msg.answer_photo(photo_id, caption=confirm_text, reply_markup=main_kb(msg.from_user.id))
     else:
         await msg.answer(confirm_text, reply_markup=main_kb(msg.from_user.id))
 
-    # Уведомление всем старшим админам
     for aid in SENIOR_ADMINS:
         if aid != msg.from_user.id:
             try:
@@ -755,7 +896,30 @@ async def confirm_bought_input(msg: types.Message, state: FSMContext):
                     await bot.send_message(aid, confirm_text)
             except: pass
 
-    # Врач НЕ получает уведомление сразу — только в 22:00 итог дня
+    # Врач НЕ получает уведомление сразу — только в 22:00
+
+@dp.message(ConfirmBonus.edit)
+async def confirm_bonus_edit(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Отмена":
+        await state.clear()
+        await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id)); return
+    try:
+        new_bonus = float(msg.text.replace(" ","").replace(",",".").replace("сум","").strip())
+        if new_bonus < 0: raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите сумму числом, например: 50000"); return
+
+    await state.update_data(custom_bonus=new_bonus)
+    await msg.answer(
+        f"✅ Бонус изменён на <b>{fmt(int(new_bonus))}</b>\n\n"
+        f"Теперь отправьте фото чека или введите время:",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="🕐 Сейчас")],
+            [KeyboardButton(text="◀️ Отмена")]
+        ])
+    )
+    await state.set_state(ConfirmBought.waiting)
 # ── Не купил ──────────────────────────────────
 @dp.callback_query(F.data.startswith("nobuy:"))
 async def cb_nobuy(call: types.CallbackQuery):
@@ -786,7 +950,263 @@ async def cb_nobuy(call: types.CallbackQuery):
             except: pass
     await call.answer()
 
-# ── Счётчик посетителей ───────────────────────
+# ── Настройки ─────────────────────────────────
+@dp.message(F.text == "⚙️ Настройки")
+async def settings_menu(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    bonus_pct = get_bonus_pct()
+    await msg.answer(
+        f"⚙️ <b>Настройки магазина</b>\n\n"
+        f"💰 Бонус врачам: <b>{bonus_pct:.0f}%</b>\n\n"
+        f"Что изменить?",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="💰 Изменить % бонуса")],
+            [KeyboardButton(text="🏷 Изменить цену товара")],
+            [KeyboardButton(text="➕ Добавить новый товар")],
+            [KeyboardButton(text="🔄 Перезапустить бот")],
+            [KeyboardButton(text="◀️ Назад")],
+        ])
+    )
+    await state.set_state(Settings.menu)
+
+@dp.message(Settings.menu)
+async def settings_choice(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.clear()
+        await msg.answer("Главное меню", reply_markup=kb_senior()); return
+
+    if msg.text == "💰 Изменить % бонуса":
+        bonus_pct = get_bonus_pct()
+        await msg.answer(
+            f"💰 Текущий бонус: <b>{bonus_pct:.0f}%</b>\n\n"
+            f"Введите новый процент (например: 15):",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+                [KeyboardButton(text="◀️ Назад")]
+            ])
+        )
+        await state.set_state(Settings.bonus_pct)
+
+    elif msg.text == "🏷 Изменить цену товара":
+        cats = get_all_categories()
+        buttons = [[KeyboardButton(text=cat)] for cat in cats.keys()]
+        buttons.append([KeyboardButton(text="◀️ Назад")])
+        await msg.answer(
+            "🏷 Выберите категорию товара:",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
+        )
+        await state.set_state(Settings.price_cat)
+
+    elif msg.text == "➕ Добавить новый товар":
+        cats = get_all_categories()
+        all_cat_names = list(cats.keys()) + ["➕ Новая категория"]
+        buttons = [[KeyboardButton(text=c)] for c in all_cat_names]
+        buttons.append([KeyboardButton(text="◀️ Назад")])
+        await msg.answer(
+            "➕ <b>Добавить новый товар</b>\n\n"
+            "Выберите категорию или создайте новую:",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
+        )
+        await state.set_state(Settings.new_prod_cat)
+
+    elif msg.text == "🔄 Перезапустить бот":
+        await msg.answer(
+            "🔄 <b>Перезапуск бота...</b>\n\n"
+            "Бот перезапустится через 3 секунды.\n"
+            "Все врачи и администраторы смогут пользоваться ботом заново.",
+            reply_markup=kb_senior()
+        )
+        await state.clear()
+        await asyncio.sleep(3)
+        import sys, os as _os
+        _os.execv(sys.executable, [sys.executable] + sys.argv)
+
+@dp.message(Settings.bonus_pct)
+async def settings_set_bonus(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.menu)
+        await settings_menu(msg, state); return
+    try:
+        pct = float(msg.text.replace("%","").strip())
+        if not 0 < pct <= 100: raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите число от 1 до 100, например: 18"); return
+    set_setting("bonus_pct", pct)
+    await state.clear()
+    await msg.answer(
+        f"✅ Бонус врачам изменён на <b>{pct:.0f}%</b>",
+        reply_markup=kb_senior()
+    )
+
+@dp.message(Settings.price_cat)
+async def settings_price_cat(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.menu)
+        await settings_menu(msg, state); return
+    cats = get_all_categories()
+    if msg.text not in cats:
+        await msg.answer("Выберите из списка."); return
+    await state.update_data(price_cat=msg.text)
+    items = cats[msg.text]
+    buttons = [[KeyboardButton(text=f"{name} (сейчас: {fmt(get_price(code))})")] for code, name, _ in items]
+    buttons.append([KeyboardButton(text="◀️ Назад")])
+    await msg.answer(
+        f"🏷 <b>{msg.text}</b>\nВыберите товар:",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=buttons)
+    )
+    await state.set_state(Settings.price_item)
+
+@dp.message(Settings.price_item)
+async def settings_price_item(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.price_cat)
+        return
+    data = await state.get_data()
+    cat  = data.get("price_cat")
+    cats = get_all_categories()
+    found_code = None
+    found_name = None
+    for code, name, _ in cats.get(cat, []):
+        if msg.text.startswith(name):
+            found_code = code
+            found_name = name
+            break
+    if not found_code:
+        await msg.answer("Выберите из списка."); return
+    await state.update_data(price_code=found_code, price_name=found_name)
+    await msg.answer(
+        f"🏷 <b>{found_name}</b>\n"
+        f"Текущая цена: <b>{fmt(get_price(found_code))}</b>\n\n"
+        f"Введите новую цену в сумах (например: 250000):",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="◀️ Назад")]
+        ])
+    )
+    await state.set_state(Settings.price_value)
+
+@dp.message(Settings.price_value)
+async def settings_set_price(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.price_item)
+        return
+    try:
+        price = int(msg.text.replace(" ","").replace("сум","").replace(",","").strip())
+        if price <= 0: raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите сумму числом, например: 250000"); return
+    data = await state.get_data()
+    code = data.get("price_code")
+    name = data.get("price_name")
+    set_setting(f"price_{code}", price)
+    await state.clear()
+    await msg.answer(
+        f"✅ Цена <b>{name}</b> изменена на <b>{fmt(price)}</b>",
+        reply_markup=kb_senior()
+    )
+
+# ── Добавить новый товар ───────────────────────
+@dp.message(Settings.new_prod_cat)
+async def new_prod_cat(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.menu)
+        await settings_menu(msg, state); return
+    if msg.text == "➕ Новая категория":
+        await msg.answer(
+            "Введите название новой категории (например: 🦷 Стоматология):",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+                [KeyboardButton(text="◀️ Назад")]
+            ])
+        )
+    await state.update_data(new_cat=msg.text)
+    await msg.answer(
+        f"📦 Категория: <b>{msg.text}</b>\n\n"
+        f"Введите <b>название товара</b>:",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="◀️ Назад")]
+        ])
+    )
+    await state.set_state(Settings.new_prod_name)
+
+@dp.message(Settings.new_prod_name)
+async def new_prod_name_handler(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.new_prod_cat)
+        return
+    await state.update_data(new_name=msg.text.strip())
+    await msg.answer(
+        f"📦 Товар: <b>{msg.text.strip()}</b>\n\n"
+        f"Введите <b>цену</b> в сумах (например: 300000):",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text="◀️ Назад")]
+        ])
+    )
+    await state.set_state(Settings.new_prod_price)
+
+@dp.message(Settings.new_prod_price)
+async def new_prod_price_handler(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.new_prod_name)
+        return
+    try:
+        price = int(msg.text.replace(" ","").replace("сум","").replace(",","").strip())
+        if price <= 0: raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите сумму числом, например: 300000"); return
+    await state.update_data(new_price=price)
+    bonus_pct = get_bonus_pct()
+    await msg.answer(
+        f"💰 Введите <b>% бонуса</b> для этого товара\n\n"
+        f"Или нажмите <b>Общий ({bonus_pct:.0f}%)</b> чтобы использовать стандартный:",
+        reply_markup=ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+            [KeyboardButton(text=f"Общий ({bonus_pct:.0f}%)")],
+            [KeyboardButton(text="◀️ Назад")]
+        ])
+    )
+    await state.set_state(Settings.new_prod_bonus)
+
+@dp.message(Settings.new_prod_bonus)
+async def new_prod_bonus_handler(msg: types.Message, state: FSMContext):
+    if not is_senior(msg.from_user.id): return
+    if msg.text == "◀️ Назад":
+        await state.set_state(Settings.new_prod_price)
+        return
+    data = await state.get_data()
+    bonus_pct_custom = 0  # 0 = использовать общий
+    if not msg.text.startswith("Общий"):
+        try:
+            bonus_pct_custom = float(msg.text.replace("%","").strip())
+            if not 0 <= bonus_pct_custom <= 100: raise ValueError
+        except ValueError:
+            await msg.answer("❌ Введите число от 0 до 100, например: 15"); return
+
+    # Генерируем код
+    import re
+    code = "CUSTOM_" + re.sub(r'[^A-Za-z0-9]', '', data["new_name"].upper())[:10] + "_" + str(random.randint(100,999))
+
+    with db() as con:
+        con.execute(
+            "INSERT INTO custom_products (code, name, category, price, bonus_pct) VALUES (?,?,?,?,?)",
+            (code, data["new_name"], data["new_cat"], data["new_price"], bonus_pct_custom)
+        )
+
+    await state.clear()
+    bonus_display = f"{bonus_pct_custom:.0f}%" if bonus_pct_custom > 0 else f"общий ({get_bonus_pct():.0f}%)"
+    await msg.answer(
+        f"✅ <b>Товар добавлен!</b>\n\n"
+        f"📦 {data['new_name']}\n"
+        f"📂 {data['new_cat']}\n"
+        f"💵 {fmt(data['new_price'])}\n"
+        f"💰 Бонус: {bonus_display}\n\n"
+        f"Товар сразу доступен врачам в каталоге.",
+        reply_markup=kb_senior()
+    )
 @dp.message(F.text == "🚶 Клиент пришёл")
 async def client_arrived(msg: types.Message):
     if not is_admin(msg.from_user.id): return
@@ -1034,21 +1454,19 @@ async def doc_bonuses(msg: types.Message):
     doc = doctor_by_tg(msg.from_user.id)
     if not doc: return
 
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-
     with db() as con:
-        # Только подтверждённые покупки ДО сегодня
-        earned_row = con.execute("""
-            SELECT COUNT(*),
-                   COALESCE(SUM(bonus), 0)
+        # Только бонусы которые уже были отправлены врачу в 22:00
+        notified_row = con.execute("""
+            SELECT COUNT(*), COALESCE(SUM(bonus), 0)
             FROM referrals
-            WHERE doctor_id=? AND status='bought' AND sent_at NOT LIKE ?
-        """, (doc[0], f"{today}%")).fetchone()
+            WHERE doctor_id=? AND status='bought' AND notified=1
+        """, (doc[0],)).fetchone()
 
         # Выплаты
-        paid_row = con.execute("""
-            SELECT COALESCE(SUM(amount), 0) FROM payments WHERE doctor_id=?
-        """, (doc[0],)).fetchone()
+        paid_row = con.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE doctor_id=?",
+            (doc[0],)
+        ).fetchone()
 
         # История выплат
         payments = con.execute("""
@@ -1056,37 +1474,28 @@ async def doc_bonuses(msg: types.Message):
             WHERE doctor_id=? ORDER BY paid_at DESC LIMIT 10
         """, (doc[0],)).fetchall()
 
-        # Бонусы сегодня — скрыты
-        today_bonus = con.execute("""
-            SELECT COALESCE(SUM(bonus), 0) FROM referrals
-            WHERE doctor_id=? AND status='bought' AND sent_at LIKE ?
-        """, (doc[0], f"{today}%")).fetchone()[0] or 0
-
-    earned  = earned_row[1] or 0
-    cnt     = earned_row[0] or 0
+    cnt     = notified_row[0] or 0
+    earned  = notified_row[1] or 0
     paid    = paid_row[0] or 0
     balance = earned - paid
 
     lines = [
         f"💰 <b>Мои бонусы</b>\n",
-        f"📦 Покупок подтверждено: <b>{cnt}</b>",
+        f"📦 Покупок: <b>{cnt}</b>",
         f"💰 Накоплено: <b>{fmt(int(earned))}</b>",
         f"✅ Выплачено: <b>{fmt(int(paid))}</b>",
         f"💵 <b>К выплате: {fmt(int(max(0, balance)))}</b>",
+        f"\n<i>Обновляется каждый день в 22:00 🌙</i>",
     ]
-
-    if today_bonus > 0:
-        lines.append(f"\n⏳ <i>Бонусы за сегодня придут в 22:00</i>")
 
     if payments:
         lines.append(f"\n💳 <b>История выплат:</b>")
         for amount, paid_at in payments:
             lines.append(f"  • {fmt(int(amount))} — {paid_at[:16]}")
 
-    if not payments:
-        lines.append(f"\n<i>Выплат пока не было</i>")
-
     await msg.answer("\n".join(lines))
+
+@dp.message(F.text == "🕐 Мои направления")
 async def doc_refs(msg: types.Message):
     doc = doctor_by_tg(msg.from_user.id)
     if not doc: return
@@ -1099,10 +1508,11 @@ async def doc_refs(msg: types.Message):
         await msg.answer("📭 Направлений пока нет."); return
     sm = {"pending":"⏳","bought":"✅","notbought":"❌"}
     lines = ["🕐 <b>Последние направления:</b>\n"]
+    all_prods = get_all_products()
     for items_json, hours, status, bonus, sent_at, bought_at, ref_num in refs:
         dt = f"\n   📅 {bought_at[:16]}" if status=="bought" and bought_at else ""
         items = json.loads(items_json)
-        names = ", ".join(PRODUCTS.get(c,(c,0))[0] for c,_ in items)
+        names = ", ".join(all_prods.get(c,(c,0))[0] for c,_ in items)
         lines.append(f"{sm.get(status,'?')} <b>{ref_num}</b>\n   📦 {names}{dt}\n   🕐 {sent_at[:16]}\n")
     await msg.answer("\n".join(lines))
 
